@@ -1,0 +1,109 @@
+name: Publish XimeYao Portable Test Release
+
+on:
+  push:
+    branches: [portable-test]
+    paths:
+      - ".github/workflows/publish-portable.yml"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish verified Windows portable ZIP
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: "38422122236"
+      RELEASE_TAG: "v0.3.1-portable-test.1"
+      ARTIFACT_NAME: "XimeYao-Portable-win-x64"
+    steps:
+      - name: Wait for Windows build success
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run watch "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+          source_repo=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq '.head_repository.full_name')
+          source_branch=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq '.head_branch')
+          if [ "$source_repo" != "$GITHUB_REPOSITORY" ] || [ "$source_branch" != "portable-test" ]; then
+            echo "Unexpected source run repository/branch: $source_repo / $source_branch" >&2
+            exit 1
+          fi
+
+      - name: Download portable Windows artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/XimeYao-Portable-x64
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir dist/XimeYao-Portable-x64
+
+      - name: Validate and compress release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/XimeYao-Portable-x64"
+          for file in \
+            winxime-server.exe \
+            winxime-setup.exe \
+            winxime-tsf-register.exe \
+            winxime_tsf.dll \
+            rime.dll \
+            sherpa-onnx-c-api.dll \
+            onnxruntime.dll \
+            Launcher.ps1 \
+            Start.cmd \
+            Unregister.cmd \
+            README-PORTABLE.txt \
+            resources/plugins/webdav-clipboard-sync/main.js; do
+              if [ ! -s "$package/$file" ]; then
+                echo "Missing or empty required file: $file" >&2
+                exit 1
+              fi
+          done
+          test -d "$package/user-data"
+          (
+            cd dist
+            zip -q -r XimeYao-Portable-win-x64.zip XimeYao-Portable-x64
+            sha256sum XimeYao-Portable-win-x64.zip > XimeYao-Portable-win-x64.zip.sha256
+          )
+          ls -lh dist/XimeYao-Portable-win-x64.zip
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > dist/release-notes.md <<'EOF'
+          XimeYao v0.3.1 Windows x64 portable-folder test build.
+
+          - Download the ZIP, extract it completely to a fixed folder, and run Start.cmd.
+          - The first start requires Administrator consent to register the Windows TSF input method. Use Win+Space to switch.
+          - WebDAV clipboard sync plugin and setup app are included.
+          - To remove registration, run Unregister.cmd before moving or deleting the folder.
+          - User dictionary and plugin data remain in %APPDATA%\\Xime.
+          - This is an experimental prerelease, not a zero-install or zero-trace USB portable app.
+          - Speech settings page has been temporarily disabled to work around an upstream Windows build issue.
+          - Do not install alongside another XimeYao build with the same TSF GUID.
+
+          Source: https://github.com/luoquan0/XimeYao/tree/portable-test
+          GitHub Actions Windows build: https://github.com/luoquan0/XimeYao/actions/runs/38422122236
+          EOF
+
+      - name: Publish GitHub prerelease with ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release tag $RELEASE_TAG already exists. Refusing to overwrite." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            dist/XimeYao-Portable-win-x64.zip \
+            dist/XimeYao-Portable-win-x64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "XimeYao v0.3.1 Windows x64 Portable Test" \
+            --notes-file dist/release-notes.md \
+            --prerelease
