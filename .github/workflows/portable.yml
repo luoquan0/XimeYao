@@ -1,0 +1,143 @@
+name: Build Windows Portable ZIP
+
+on:
+  push:
+    branches:
+      - portable-test
+    paths:
+      - ".github/workflows/portable.yml"
+      - "portable/**"
+      - "crates/winxime-setup/Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Portable Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Checkout with input scheme submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Initialize nested submodules
+        run: git submodule update --init --recursive
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile Windows release
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)" }
+
+      - name: Assemble portable folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = Join-Path $PWD "target\release"
+          $stage = Join-Path $PWD "dist\XimeYao-Portable-x64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          $required = @(
+            "winxime-server.exe",
+            "winxime-setup.exe",
+            "winxime-tsf-register.exe",
+            "winxime_tsf.dll",
+            "sherpa-onnx-c-api.dll",
+            "onnxruntime.dll"
+          )
+          foreach ($name in $required) {
+            $file = Join-Path $release $name
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Required runtime file missing: $file"
+            }
+            Copy-Item -LiteralPath $file -Destination $stage
+          }
+
+          foreach ($name in @("onnxruntime_providers_shared.dll", "sherpa-onnx-cxx-api.dll")) {
+            $file = Join-Path $release $name
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+              Copy-Item -LiteralPath $file -Destination $stage
+            }
+          }
+
+          $metadata = (& cargo metadata --format-version 1) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $pkg = $metadata.packages | Where-Object { $_.name -eq "librime-sys2" } | Select-Object -First 1
+          if (-not $pkg) { throw "librime-sys2 missing in cargo metadata" }
+          $libximecore = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $pkg.manifest_path))
+          $rime = Join-Path $libximecore "librime\dist\lib\rime.dll"
+          if (-not (Test-Path -LiteralPath $rime -PathType Leaf)) { throw "rime.dll missing: $rime" }
+          Copy-Item -LiteralPath $rime -Destination (Join-Path $stage "rime.dll")
+
+          foreach ($dir in @("data", "resources", "user-data")) {
+            New-Item -ItemType Directory -Path (Join-Path $stage $dir) -Force | Out-Null
+          }
+          Copy-Item -Path "resources\*" -Destination (Join-Path $stage "resources") -Recurse -Force
+
+          $schemeRoot = (Resolve-Path "rime-wubi").Path.TrimEnd("\")
+          $schemeFiles = Get-ChildItem -LiteralPath $schemeRoot -Recurse -File
+          foreach ($file in $schemeFiles) {
+            $relative = $file.FullName.Substring($schemeRoot.Length + 1)
+            if ($relative -match '(^|\\)(\.git|\.github|imgs)(\\|$)') { continue }
+            if ($file.Name -match '^(LICENSE|\.gitignore|squirrel\.custom\.yaml|trime\.custom\.yaml|macOS-.*)$') { continue }
+            if ($file.Name -like "*.md" -or $file.Name -like "*.command") { continue }
+            $dest = Join-Path (Join-Path $stage "user-data") $relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $dest
+          }
+
+          Copy-Item -LiteralPath "portable\Launcher.ps1" -Destination (Join-Path $stage "Launcher.ps1")
+          Copy-Item -LiteralPath "LICENSE" -Destination $stage
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launcher.ps1" -Mode Start
+          if errorlevel 1 (echo XimeYao startup failed. & pause)
+          '@ | Set-Content -LiteralPath (Join-Path $stage "Start.cmd") -Encoding ASCII
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launcher.ps1" -Mode Unregister
+          if errorlevel 1 (echo XimeYao unregister failed. & pause)
+          '@ | Set-Content -LiteralPath (Join-Path $stage "Unregister.cmd") -Encoding ASCII
+
+          @'
+          XimeYao Windows x64 - folder-based test build
+          1. Extract ALL files to a fixed local folder.
+          2. Run Start.cmd, approve one-time administrator TSF registration.
+          3. Use Win+Space to choose XimeYao; open winxime-setup.exe to configure.
+          4. Use Unregister.cmd to remove the TSF registration before moving/deleting this folder.
+          Keep this folder at the same path while using the input method.
+          User dictionary and plugin data remain at %APPDATA%\Xime (not beside the EXE).
+          This is not zero-install or zero-trace portable: TSF requires Windows registration.
+          Do not run beside an installed XimeYao MSI/MSIX using the same TSF GUID.
+          Clipboard WebDAV plugin is included in resources/plugins.
+          Voice settings page disabled for this test build due to an upstream Windows feature-gate bug.
+          '@ | Set-Content -LiteralPath (Join-Path $stage "README-PORTABLE.txt") -Encoding UTF8
+
+          foreach ($name in @("winxime-server.exe", "winxime_tsf.dll", "rime.dll", "sherpa-onnx-c-api.dll", "onnxruntime.dll", "Start.cmd", "Unregister.cmd")) {
+            $file = Join-Path $stage $name
+            if ((Get-Item -LiteralPath $file).Length -eq 0) { throw "Empty output file: $file" }
+          }
+          Write-Host "Portable output staged at $stage"
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table
+
+      - name: Upload downloadable portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: XimeYao-Portable-win-x64
+          path: dist/XimeYao-Portable-x64/
+          if-no-files-found: error
+          retention-days: 30
