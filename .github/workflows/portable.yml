@@ -36,7 +36,7 @@ jobs:
       - name: Compile Windows release
         shell: pwsh
         run: |
-          cargo build --release --locked
+          cargo build --release
           if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)" }
 
       - name: Assemble portable folder
